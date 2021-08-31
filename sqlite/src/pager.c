@@ -435,6 +435,7 @@ struct PagerSavepoint {
   Bitvec *pInSavepoint;        /* Set of pages in this savepoint */
   Pgno nOrig;                  /* Original number of pages in file */
   Pgno iSubRec;                /* Index of first record in sub-journal */
+  int bTruncateOnRelease;      /* If stmt journal may be truncated on RELEASE */
 #ifndef SQLITE_OMIT_WAL
   u32 aWalData[WAL_SAVEPOINT_NDATA];        /* WAL savepoint context */
 #endif
@@ -1070,6 +1071,9 @@ static int subjRequiresPage(PgHdr *pPg){
   for(i=0; i<pPager->nSavepoint; i++){
     p = &pPager->aSavepoint[i];
     if( p->nOrig>=pgno && 0==sqlite3BitvecTestNotNull(p->pInSavepoint, pgno) ){
+      for(i=i+1; i<pPager->nSavepoint; i++){
+        pPager->aSavepoint[i].bTruncateOnRelease = 0;
+      }
       return 1;
     }
   }
@@ -2486,6 +2490,7 @@ static int pager_delsuper(Pager *pPager, const char *zSuper){
   i64 nSuperJournal;        /* Size of super-journal file */
   char *zJournal;           /* Pointer to one journal within MJ file */
   char *zSuperPtr;          /* Space to hold super-journal filename */
+  char *zFree = 0;          /* Free this buffer */
   int nSuperPtr;            /* Amount of space allocated to zSuperPtr[] */
 
   /* Allocate space for both the pJournal and pSuper file descriptors.
@@ -2510,11 +2515,13 @@ static int pager_delsuper(Pager *pPager, const char *zSuper){
   rc = sqlite3OsFileSize(pSuper, &nSuperJournal);
   if( rc!=SQLITE_OK ) goto delsuper_out;
   nSuperPtr = pVfs->mxPathname+1;
-  zSuperJournal = sqlite3Malloc(nSuperJournal + nSuperPtr + 2);
-  if( !zSuperJournal ){
+  zFree = sqlite3Malloc(4 + nSuperJournal + nSuperPtr + 2);
+  if( !zFree ){
     rc = SQLITE_NOMEM_BKPT;
     goto delsuper_out;
   }
+  zFree[0] = zFree[1] = zFree[2] = zFree[3] = 0;
+  zSuperJournal = &zFree[4];
   zSuperPtr = &zSuperJournal[nSuperJournal+2];
   rc = sqlite3OsRead(pSuper, zSuperJournal, (int)nSuperJournal, 0);
   if( rc!=SQLITE_OK ) goto delsuper_out;
@@ -2562,7 +2569,7 @@ static int pager_delsuper(Pager *pPager, const char *zSuper){
   rc = sqlite3OsDelete(pVfs, zSuper, 0);
 
 delsuper_out:
-  sqlite3_free(zSuperJournal);
+  sqlite3_free(zFree);
   if( pSuper ){
     sqlite3OsClose(pSuper);
     assert( !isOpen(pJournal) );
@@ -2900,7 +2907,11 @@ end_playback:
   pPager->changeCountDone = pPager->tempFile;
 
   if( rc==SQLITE_OK ){
-    zSuper = pPager->pTmpSpace;
+    /* Leave 4 bytes of space before the super-journal filename in memory.
+    ** This is because it may end up being passed to sqlite3OsOpen(), in
+    ** which case it requires 4 0x00 bytes in memory immediately before
+    ** the filename. */
+    zSuper = &pPager->pTmpSpace[4];
     rc = readSuperJournal(pPager->jfd, zSuper, pPager->pVfs->mxPathname+1);
     testcase( rc!=SQLITE_OK );
   }
@@ -2917,6 +2928,8 @@ end_playback:
     /* If there was a super-journal and this routine will return success,
     ** see if it is possible to delete the super-journal.
     */
+    assert( zSuper==&pPager->pTmpSpace[4] );
+    memset(&zSuper[-4], 0, 4);
     rc = pager_delsuper(pPager, zSuper);
     testcase( rc!=SQLITE_OK );
   }
@@ -3923,7 +3936,8 @@ static void assertTruncateConstraint(Pager *pPager){
 ** then continue writing to the database.
 */
 void sqlite3PagerTruncateImage(Pager *pPager, Pgno nPage){
-  assert( pPager->dbSize>=nPage );
+  assert( pPager->dbSize>=nPage || CORRUPT_DB );
+  testcase( pPager->dbSize<nPage );
   assert( pPager->eState>=PAGER_WRITER_CACHEMOD );
   pPager->dbSize = nPage;
 
@@ -4651,7 +4665,7 @@ int sqlite3PagerOpen(
   int rc = SQLITE_OK;      /* Return code */
   int tempFile = 0;        /* True for temp files (incl. in-memory files) */
   int memDb = 0;           /* True if this is an in-memory file */
-#ifdef SQLITE_ENABLE_DESERIALIZE
+#ifndef SQLITE_OMIT_DESERIALIZE
   int memJM = 0;           /* Memory journal mode */
 #else
 # define memJM 0
@@ -4855,7 +4869,7 @@ int sqlite3PagerOpen(
     int fout = 0;                    /* VFS flags returned by xOpen() */
     rc = sqlite3OsOpen(pVfs, pPager->zFilename, pPager->fd, vfsFlags, &fout);
     assert( !memDb );
-#ifdef SQLITE_ENABLE_DESERIALIZE
+#ifndef SQLITE_OMIT_DESERIALIZE
     memJM = (fout&SQLITE_OPEN_MEMORY)!=0;
 #endif
     readOnly = (fout&SQLITE_OPEN_READONLY)!=0;
@@ -5823,7 +5837,7 @@ int sqlite3PagerBegin(Pager *pPager, int exFlag, int subjInMemory){
   assert( pPager->eState>=PAGER_READER && pPager->eState<PAGER_ERROR );
   pPager->subjInMemory = (u8)subjInMemory;
 
-  if( ALWAYS(pPager->eState==PAGER_READER) ){
+  if( pPager->eState==PAGER_READER ){
     assert( pPager->pInJournal==0 );
 
     if( pagerUseWal(pPager) ){
@@ -6839,6 +6853,7 @@ static SQLITE_NOINLINE int pagerOpenSavepoint(Pager *pPager, int nSavepoint){
     }
     aNew[ii].iSubRec = pPager->nSubRec;
     aNew[ii].pInSavepoint = sqlite3BitvecCreate(pPager->dbSize);
+    aNew[ii].bTruncateOnRelease = 1;
     if( !aNew[ii].pInSavepoint ){
       return SQLITE_NOMEM_BKPT;
     }
@@ -6920,13 +6935,15 @@ int sqlite3PagerSavepoint(Pager *pPager, int op, int iSavepoint){
     /* If this is a release of the outermost savepoint, truncate 
     ** the sub-journal to zero bytes in size. */
     if( op==SAVEPOINT_RELEASE ){
-      if( nNew==0 && isOpen(pPager->sjfd) ){
+      PagerSavepoint *pRel = &pPager->aSavepoint[nNew];
+      if( pRel->bTruncateOnRelease && isOpen(pPager->sjfd) ){
         /* Only truncate if it is an in-memory sub-journal. */
         if( sqlite3JournalIsInMemory(pPager->sjfd) ){
-          rc = sqlite3OsTruncate(pPager->sjfd, 0);
+          i64 sz = (pPager->pageSize+4)*pRel->iSubRec;
+          rc = sqlite3OsTruncate(pPager->sjfd, sz);
           assert( rc==SQLITE_OK );
         }
-        pPager->nSubRec = 0;
+        pPager->nSubRec = pRel->iSubRec;
       }
     }
     /* Else this is a rollback operation, playback the specified savepoint.
